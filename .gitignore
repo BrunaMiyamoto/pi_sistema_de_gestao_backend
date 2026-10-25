@@ -224,3 +224,13 @@ database.db
 node_modules/
 frontend/dist/
 *.local
+
+# Backups locais do SQLite
+*_backup*.db
+
+
+# Configuracoes locais do VS Code
+.vscode/
+
+# Arquivos tecnicos enviados pela Ferramentaria
+arquivos_privados/

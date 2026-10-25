@@ -1,5 +1,7 @@
-
 fastapi
 uvicorn
 pwdlib[argon2]
 email-validator
+PyJWT
+python-dotenv
+python-multipart
