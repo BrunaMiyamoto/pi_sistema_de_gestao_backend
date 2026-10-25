@@ -140,6 +140,33 @@ def criar_tabelas():
             CREATE INDEX IF NOT EXISTS idx_anexos_pedido
             ON anexos_pedidos(pedido_id)
         """)
+        # Um pedido pode ter varias propostas, inclusive revisoes.
+        # Valores monetarios em centavos evitam imprecisao com FLOAT.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orcamentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pedido_id INTEGER NOT NULL REFERENCES pedidos(id),
+                numero_revisao INTEGER NOT NULL CHECK (numero_revisao >= 1),
+                valor_orcado_centavos INTEGER NOT NULL CHECK (valor_orcado_centavos >= 0),
+                valor_fechado_centavos INTEGER CHECK (valor_fechado_centavos >= 0),
+                situacao TEXT NOT NULL DEFAULT 'apresentado'
+                    CHECK (situacao IN ('apresentado', 'aprovado', 'recusado', 'substituido')),
+                apresentado_em TEXT NOT NULL,
+                decidido_em TEXT,
+                observacoes TEXT,
+                criado_por INTEGER NOT NULL REFERENCES usuarios(id),
+                criado_em TEXT NOT NULL,
+                UNIQUE (pedido_id, numero_revisao)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_orcamentos_pedido
+            ON orcamentos(pedido_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_orcamentos_apresentado_em
+            ON orcamentos(apresentado_em)
+        """)
         conexao.commit()
     except Exception:
         conexao.rollback()

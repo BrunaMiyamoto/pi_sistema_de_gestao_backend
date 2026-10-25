@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import os
 import sqlite3
 from pathlib import Path
@@ -665,5 +666,248 @@ def baixar_anexo(
             filename=registro["nome_original"],
             content_disposition_type="attachment",
         )
+    finally:
+        conexao.close()
+
+
+
+# Valores recebidos em reais; armazenados como centavos inteiros no SQLite.
+class OrcamentoCriar(BaseModel):
+    valor_orcado: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    apresentado_em: date
+    observacoes: str = ""
+
+
+class OrcamentoDecidir(BaseModel):
+    situacao: str  # aprovado ou recusado
+    valor_fechado: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
+
+
+def para_centavos(valor: Decimal) -> int:
+    return int((valor * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def serializar_orcamento(registro):
+    orcamento = dict(registro)
+    orcamento["valor_orcado"] = f'{Decimal(orcamento["valor_orcado_centavos"]) / 100:.2f}'
+    centavos = orcamento["valor_fechado_centavos"]
+    orcamento["valor_fechado"] = f'{Decimal(centavos) / 100:.2f}' if centavos is not None else None
+    return orcamento
+
+
+def obter_orcamento(conexao, pedido_id: int, orcamento_id: int):
+    registro = conexao.execute(
+        "SELECT * FROM orcamentos WHERE id = ? AND pedido_id = ?", (orcamento_id, pedido_id)
+    ).fetchone()
+    if registro is None:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    return registro
+
+
+@app.post("/pedidos/{pedido_id}/orcamentos", status_code=201)
+def cadastrar_orcamento(
+    pedido_id: int,
+    dados: OrcamentoCriar,
+    usuario: dict = Depends(exigir_funcionario),
+):
+    conexao = conectar_banco()
+    try:
+        # Transação de escrita impede números de revisão repetidos em requisições simultâneas.
+        conexao.execute("BEGIN IMMEDIATE")
+        verificar_pedido_ativo(conexao, pedido_id)
+        ultima = conexao.execute(
+            "SELECT * FROM orcamentos WHERE pedido_id = ? ORDER BY numero_revisao DESC LIMIT 1",
+            (pedido_id,),
+        ).fetchone()
+        if ultima is not None and ultima["situacao"] == "aprovado":
+            raise HTTPException(status_code=409, detail="Já existe um orçamento aprovado neste pedido")
+        if ultima is not None and ultima["situacao"] == "apresentado":
+            conexao.execute(
+                "UPDATE orcamentos SET situacao = 'substituido' WHERE id = ?",
+                (ultima["id"],),
+            )
+        revisao = ultima["numero_revisao"] + 1 if ultima is not None else 1
+        cursor = conexao.execute("""
+            INSERT INTO orcamentos
+              (pedido_id, numero_revisao, valor_orcado_centavos, situacao,
+               apresentado_em, observacoes, criado_por, criado_em)
+            VALUES (?, ?, ?, 'apresentado', ?, ?, ?, ?)
+        """, (
+            pedido_id, revisao, para_centavos(dados.valor_orcado),
+            dados.apresentado_em.isoformat(), dados.observacoes.strip(),
+            usuario["id"], datetime.now(timezone.utc).isoformat(),
+        ))
+        novo = obter_orcamento(conexao, pedido_id, cursor.lastrowid)
+        conexao.commit()
+        return serializar_orcamento(novo)
+    except Exception:
+        conexao.rollback()
+        raise
+    finally:
+        conexao.close()
+
+
+@app.get("/pedidos/{pedido_id}/orcamentos")
+def listar_orcamentos(pedido_id: int, usuario: dict = Depends(exigir_funcionario)):
+    conexao = conectar_banco()
+    try:
+        verificar_pedido_ativo(conexao, pedido_id)
+        registros = conexao.execute(
+            "SELECT * FROM orcamentos WHERE pedido_id = ? ORDER BY numero_revisao",
+            (pedido_id,),
+        ).fetchall()
+        return [serializar_orcamento(r) for r in registros]
+    finally:
+        conexao.close()
+
+
+@app.put("/pedidos/{pedido_id}/orcamentos/{orcamento_id}/decisao")
+def decidir_orcamento(
+    pedido_id: int,
+    orcamento_id: int,
+    dados: OrcamentoDecidir,
+    usuario: dict = Depends(exigir_funcionario),
+):
+    if dados.situacao not in ("aprovado", "recusado"):
+        raise HTTPException(status_code=400, detail="Situação deve ser aprovado ou recusado")
+    if dados.situacao == "recusado" and dados.valor_fechado is not None:
+        raise HTTPException(status_code=400, detail="Orçamento recusado não possui valor fechado")
+    if dados.situacao == "aprovado" and dados.valor_fechado is None:
+        raise HTTPException(status_code=400, detail="Informe o valor fechado do orçamento aprovado")
+
+    conexao = conectar_banco()
+    try:
+        conexao.execute("BEGIN IMMEDIATE")
+        verificar_pedido_ativo(conexao, pedido_id)
+        registro = obter_orcamento(conexao, pedido_id, orcamento_id)
+        if registro["situacao"] != "apresentado":
+            raise HTTPException(status_code=409, detail="Somente orçamentos apresentados podem ser decididos")
+        ultima = conexao.execute(
+            "SELECT id FROM orcamentos WHERE pedido_id = ? ORDER BY numero_revisao DESC LIMIT 1",
+            (pedido_id,),
+        ).fetchone()
+        if ultima["id"] != orcamento_id:
+            raise HTTPException(status_code=409, detail="Somente a revisão mais recente pode ser decidida")
+        conexao.execute("""
+            UPDATE orcamentos
+            SET situacao = ?, valor_fechado_centavos = ?, decidido_em = ?
+            WHERE id = ?
+        """, (
+            dados.situacao,
+            para_centavos(dados.valor_fechado) if dados.valor_fechado is not None else None,
+            datetime.now(timezone.utc).date().isoformat(),
+            orcamento_id,
+        ))
+        atualizado = obter_orcamento(conexao, pedido_id, orcamento_id)
+        conexao.commit()
+        return serializar_orcamento(atualizado)
+    except Exception:
+        conexao.rollback()
+        raise
+    finally:
+        conexao.close()
+
+
+# Relatorio comercial mensal da Ferramentaria.
+# Permissoes: apenas funcionario e administrador.
+# Uma revisao substituida nao entra na soma dos valores orcados,
+# mas conta como proposta apresentada para fins de volume de trabalho.
+@app.get("/relatorios/comercial")
+def relatorio_comercial(
+    mes: str = Query(description="Mes de referencia no formato AAAA-MM (ex.: 2026-10)"),
+    usuario: dict = Depends(exigir_funcionario),
+):
+    try:
+        if len(mes) != 7 or mes[4] != "-" or not (mes[:4] + mes[5:]).isdigit():
+            raise ValueError()
+        date.fromisoformat(mes + "-01")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Mes invalido. Use AAAA-MM")
+
+    conexao = conectar_banco()
+    try:
+        # Hit rate por safra de pedidos: entre os pedidos abertos neste mes,
+        # quantos ja receberam ao menos um orcamento (mesmo depois da abertura).
+        recebidos = conexao.execute("""
+            SELECT COUNT(*) AS total
+            FROM pedidos
+            WHERE excluido = 0 AND substr(data, 1, 7) = ?
+        """, (mes,)).fetchone()["total"]
+
+        orcados = conexao.execute("""
+            SELECT COUNT(*) AS total
+            FROM pedidos AS p
+            WHERE p.excluido = 0 AND substr(p.data, 1, 7) = ?
+              AND EXISTS (
+                  SELECT 1 FROM orcamentos AS o WHERE o.pedido_id = p.id
+              )
+        """, (mes,)).fetchone()["total"]
+
+        # Volume de propostas efetivamente apresentadas durante o mes,
+        # inclusive revisoes que hoje estejam marcadas como substituidas.
+        apresentadas = conexao.execute("""
+            SELECT COUNT(*) AS total
+            FROM orcamentos AS o
+            JOIN pedidos AS p ON p.id = o.pedido_id
+            WHERE p.excluido = 0 AND substr(o.apresentado_em, 1, 7) = ?
+        """, (mes,)).fetchone()["total"]
+
+        # Para os valores comerciais consideramos somente a ultima revisao
+        # de cada pedido, apresentada durante o mes selecionado.
+        # Isso evita somar o mesmo pedido diversas vezes.
+        resumo = conexao.execute("""
+            SELECT
+                COUNT(*) AS orcamentos_vigentes,
+                COALESCE(SUM(CASE WHEN o.situacao = 'aprovado' THEN 1 ELSE 0 END), 0)
+                    AS orcamentos_aprovados,
+                COALESCE(SUM(o.valor_orcado_centavos), 0) AS valor_orcado_centavos,
+                COALESCE(SUM(CASE WHEN o.situacao = 'aprovado'
+                                  THEN COALESCE(o.valor_fechado_centavos, 0)
+                                  ELSE 0 END), 0) AS valor_fechado_centavos
+            FROM orcamentos AS o
+            JOIN pedidos AS p ON p.id = o.pedido_id
+            WHERE p.excluido = 0
+              AND substr(o.apresentado_em, 1, 7) = ?
+              AND o.numero_revisao = (
+                  SELECT MAX(ou.numero_revisao)
+                  FROM orcamentos AS ou WHERE ou.pedido_id = o.pedido_id
+              )
+              AND o.situacao != 'substituido'
+        """, (mes,)).fetchone()
+
+        total_orcado = int(resumo["valor_orcado_centavos"])
+        total_fechado = int(resumo["valor_fechado_centavos"])
+
+        def percentual(numerador: int, denominador: int) -> str | None:
+            if denominador == 0:
+                return None  # Nao ha base para calcular a taxa.
+            return str(
+                (Decimal(numerador) * Decimal(100) / Decimal(denominador))
+                .quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
+
+        def reais(centavos: int) -> str:
+            return f"{Decimal(centavos) / Decimal(100):.2f}"
+
+        return {
+            "mes": mes,
+            "pedidos_recebidos": recebidos,
+            "pedidos_orcados": orcados,
+            "hit_rate_percentual": percentual(orcados, recebidos),
+            "propostas_apresentadas": apresentadas,
+            "orcamentos_vigentes": resumo["orcamentos_vigentes"],
+            "orcamentos_aprovados": resumo["orcamentos_aprovados"],
+            "valor_orcado_centavos": total_orcado,
+            "valor_fechado_centavos": total_fechado,
+            "valor_orcado": reais(total_orcado),
+            "valor_fechado": reais(total_fechado),
+            "win_rate_percentual": percentual(total_fechado, total_orcado),
+            "observacoes": {
+                "hit_rate": "Pedidos ativos abertos no mes que receberam ao menos um orcamento / pedidos ativos abertos no mes.",
+                "propostas_apresentadas": "Conta todas as propostas do mes, inclusive revisoes posteriormente substituidas.",
+                "win_rate": "Valores fechados / valores orcados das ultimas revisoes por pedido, apresentadas no mes.",
+                "sem_denominador": "Taxas retornam null quando nao existe base para o calculo.",
+            },
+        }
     finally:
         conexao.close()
