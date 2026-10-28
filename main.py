@@ -14,6 +14,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
+from pwdlib.exceptions import PwdlibError
 
 from database import criar_tabelas, conectar_banco
 
@@ -55,6 +56,7 @@ seguranca = HTTPBearer()
 PERFIS_VALIDOS = [
     "administrador",
     "funcionario",
+    "ferramentaria",
     "solicitante"
 ]
 
@@ -111,7 +113,7 @@ def login(dados: LoginDados):
 
     try:
         senha_correta = password_hash.verify(dados.senha, usuario["senha"])
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, PwdlibError):
         # Permite lidar com registros legados que não contêm um hash Argon2 válido.
         senha_correta = False
 
@@ -157,7 +159,7 @@ def usuario_atual(
 
 
 def exigir_funcionario(usuario: dict = Depends(usuario_atual)):
-    if usuario["perfil"] not in ("funcionario", "administrador"):
+    if usuario["perfil"] not in ("funcionario", "administrador", "ferramentaria"):
         raise HTTPException(status_code=403, detail="Acesso reservado à Ferramentaria")
     return usuario
 
@@ -207,7 +209,7 @@ def listar_pedidos(
     condicoes = ["excluido = 0"]
     parametros = []
 
-    if usuario["perfil"] not in ("funcionario", "administrador"):
+    if usuario["perfil"] not in ("funcionario", "administrador", "ferramentaria"):
         condicoes.append("usuario_id = ?")
         parametros.append(usuario["id"])
 
