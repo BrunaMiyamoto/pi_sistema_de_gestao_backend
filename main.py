@@ -36,12 +36,17 @@ if JWT_EXPIRE_MINUTES <= 0:
 
 app = FastAPI()
 
-# Permite requisições do frontend Vue/Vite durante o desenvolvimento local.
+# Permite requisições do frontend Vue/Vite em desenvolvimento local e em produção (Netlify).
+# ALLOWED_ORIGINS no .env/env vars do host aceita origens extras, separadas por vírgula.
+_origens_extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://jactoflow.netlify.app",
+        *_origens_extra,
     ],
     allow_credentials=True,
     allow_methods=["*"],
