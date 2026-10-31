@@ -14,6 +14,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
+from pwdlib.exceptions import PwdlibError
 
 from database import criar_tabelas, conectar_banco
 
@@ -35,12 +36,17 @@ if JWT_EXPIRE_MINUTES <= 0:
 
 app = FastAPI()
 
-# Permite requisições do frontend Vue/Vite durante o desenvolvimento local.
+# Permite requisições do frontend Vue/Vite em desenvolvimento local e em produção (Netlify).
+# ALLOWED_ORIGINS no .env/env vars do host aceita origens extras, separadas por vírgula.
+_origens_extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://jactoflow.netlify.app",
+        *_origens_extra,
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -55,6 +61,7 @@ seguranca = HTTPBearer()
 PERFIS_VALIDOS = [
     "administrador",
     "funcionario",
+    "ferramentaria",
     "solicitante"
 ]
 
@@ -78,6 +85,15 @@ class UsuarioCriar(BaseModel):
     email: EmailStr
     senha: str = Field(min_length=8)
     perfil: str = "solicitante"
+
+
+# Cadastro interno: somente administrador pode criar contas de Ferramentaria.
+# Para manter compatibilidade, os dois nomes existentes são aceitos.
+class UsuarioInternoCriar(BaseModel):
+    nome: str = Field(min_length=1)
+    email: EmailStr
+    senha: str = Field(min_length=8)
+    perfil: str = "ferramentaria"
 
 
 # Estrutura para atualizar usuarios
@@ -111,7 +127,7 @@ def login(dados: LoginDados):
 
     try:
         senha_correta = password_hash.verify(dados.senha, usuario["senha"])
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, PwdlibError):
         # Permite lidar com registros legados que não contêm um hash Argon2 válido.
         senha_correta = False
 
@@ -157,7 +173,7 @@ def usuario_atual(
 
 
 def exigir_funcionario(usuario: dict = Depends(usuario_atual)):
-    if usuario["perfil"] not in ("funcionario", "administrador"):
+    if usuario["perfil"] not in ("funcionario", "administrador", "ferramentaria"):
         raise HTTPException(status_code=403, detail="Acesso reservado à Ferramentaria")
     return usuario
 
@@ -207,7 +223,7 @@ def listar_pedidos(
     condicoes = ["excluido = 0"]
     parametros = []
 
-    if usuario["perfil"] not in ("funcionario", "administrador"):
+    if usuario["perfil"] not in ("funcionario", "administrador", "ferramentaria"):
         condicoes.append("usuario_id = ?")
         parametros.append(usuario["id"])
 
@@ -404,6 +420,53 @@ def listar_usuarios(usuario: dict = Depends(exigir_administrador)):
         """).fetchall()
 
         return [dict(usuario) for usuario in usuarios]
+    finally:
+        conexao.close()
+
+
+# Permite ao frontend descobrir o perfil validado pelo servidor após o login.
+# O nome do perfil nunca deve ser confiado ao localStorage como fonte de permissão.
+@app.get("/usuarios/me")
+def consultar_meu_perfil(usuario: dict = Depends(usuario_atual)):
+    return usuario
+
+
+# Cadastro de funcionário da Ferramentaria, restrito a administradores.
+# O cadastro público /usuarios continua sendo somente de solicitantes.
+@app.post("/usuarios/internos", status_code=201)
+def criar_usuario_interno(
+    dados: UsuarioInternoCriar,
+    administrador: dict = Depends(exigir_administrador),
+):
+    if dados.perfil not in ("ferramentaria", "funcionario"):
+        raise HTTPException(
+            status_code=400,
+            detail="Perfil interno permitido: ferramentaria ou funcionario",
+        )
+
+    nome = dados.nome.strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="O nome não pode estar vazio")
+
+    senha_protegida = password_hash.hash(dados.senha)
+    conexao = conectar_banco()
+    try:
+        cursor = conexao.execute("""
+            INSERT INTO usuarios (nome, email, senha, perfil)
+            VALUES (?, ?, ?, ?)
+        """, (
+            nome,
+            str(dados.email).lower(),
+            senha_protegida,
+            dados.perfil,
+        ))
+        conexao.commit()
+        registro = conexao.execute("""
+            SELECT id, nome, email, perfil FROM usuarios WHERE id = ?
+        """, (cursor.lastrowid,)).fetchone()
+        return dict(registro)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Este e-mail já está cadastrado")
     finally:
         conexao.close()
 
